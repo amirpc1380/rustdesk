@@ -1,6 +1,4 @@
-# Windows x64 build derived from this fork at 53996e3c404ea5083df0775057e4149e49102084.
-# Embeds default network settings; existing saved settings retain precedence.
-# Produces an unsigned EXE in Actions artifacts; manual start only.
+# Windows x64 build; verifies runtime defaults, not raw string bytes.
 name: Build ASAPSS Windows x64
 'on':
   workflow_dispatch: {}
@@ -175,23 +173,45 @@ jobs:
         anchor = "pub fn load_custom_client() {\n"
         if source.count(anchor) != 1:
             raise SystemExit("Unexpected source layout; settings were not patched")
-        block = f'''    #[cfg(windows)]
-            {{
-                let mut defaults = config::DEFAULT_SETTINGS.write().unwrap();
-                for (name, value) in [
-                    ("custom-rendezvous-server", "{host}"),
-                    ("relay-server", "{relay}"),
-                    ("key", "{key}"),
-                    ("api-server", ""),
-                ] {{
-                    defaults.insert(name.to_owned(), value.to_owned());
-                }}
+        block = f'''
+        #[cfg(windows)]
+        fn asapss_apply_embedded_defaults() {{
+            let mut defaults = config::DEFAULT_SETTINGS.write().unwrap();
+            for (name, value) in [
+                ("custom-rendezvous-server", "{host}"),
+                ("relay-server", "{relay}"),
+                ("key", "{key}"),
+                ("api-server", ""),
+            ] {{
+                defaults.insert(name.to_owned(), value.to_owned());
             }}
+        }}
+
+        // CI calls the same initializer used by load_custom_client and reads its result.
+        // No server connection, saved-config writes, or remote-control session is started.
+        #[cfg(windows)]
+        #[no_mangle]
+        pub unsafe extern "C" fn asapss_verify_defaults_json(buffer: *mut u8, capacity: usize) -> usize {{
+            asapss_apply_embedded_defaults();
+            let defaults = config::DEFAULT_SETTINGS.read().unwrap();
+            let payload = serde_json::json!({{
+                "custom-rendezvous-server": defaults.get("custom-rendezvous-server"),
+                "relay-server": defaults.get("relay-server"),
+                "key": defaults.get("key"),
+                "api-server": defaults.get("api-server"),
+            }}).to_string();
+            if !buffer.is_null() && capacity >= payload.len() {{
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), buffer, payload.len());
+            }}
+            payload.len()
+        }}
+
         '''
-        path.write_text(source.replace(anchor, anchor + block, 1), encoding="utf-8")
-        print("Embedded default ID server:", host)
-        print("Embedded default relay server:", relay)
-        print("Embedded public key:", key)
+        hook = "    #[cfg(windows)]\n    asapss_apply_embedded_defaults();\n"
+        patched = source.replace(anchor, block + anchor + hook, 1)
+        path.write_text(patched, encoding="utf-8")
+        assert "pub fn load_custom_client() {\n" + hook in patched
+        print("Patched runtime defaults and exported verification function")
     - name: Restore bridge files
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
@@ -232,7 +252,7 @@ jobs:
         components: rustfmt
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       with:
-        prefix-key: ${{ matrix.job.os }}
+        prefix-key: asapss-runtime-defaults-v2-${{ matrix.job.os }}
     - name: Setup vcpkg with Github Actions binary cache
       uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
       with:
@@ -301,15 +321,6 @@ jobs:
         } catch {
             Write-Host "Ingore the printer driver error."
         }
-    - name: Verify settings are present in the compiled DLL
-      shell: python
-      run: |
-        from pathlib import Path
-        data = Path("rustdesk/librustdesk.dll").read_bytes()
-        for value in ["r.asapss.ir", "FCukWggv4pqqFwJHx1VKYuU5q0YXo+jwXLyfEiw8teY="]:
-            if value.encode("utf-8") not in data:
-                raise SystemExit("Compiled DLL is missing embedded settings: " + value)
-        print("Server and public key found in compiled DLL")
     - name: find Runner.res
       continue-on-error: true
       shell: bash
@@ -329,6 +340,50 @@ jobs:
       with:
         name: topmostwindow-artifacts-x64
         path: ./rustdesk
+    - name: Verify embedded defaults by executing the compiled DLL
+      shell: python
+      run: |
+        import ctypes
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+
+        dll = Path("rustdesk/librustdesk.dll").resolve()
+        built = Path("target/release/librustdesk.dll").resolve()
+        if not dll.is_file() or not built.is_file():
+            raise SystemExit("Expected compiled and packaged DLLs were not found")
+        digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+        if digest(dll) != digest(built):
+            raise SystemExit("Packaged DLL does not match the DLL just built by Cargo")
+        if ctypes.sizeof(ctypes.c_void_p) != 8:
+            raise SystemExit("The x64 DLL requires 64-bit Python")
+
+        with os.add_dll_directory(str(dll.parent)):
+            lib = ctypes.CDLL(str(dll))
+            probe = lib.asapss_verify_defaults_json
+            probe.argtypes = [ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t]
+            probe.restype = ctypes.c_size_t
+            buffer = (ctypes.c_ubyte * 65536)()
+            length = probe(buffer, len(buffer))
+            if not 0 < length <= len(buffer):
+                raise SystemExit("Invalid verification response length")
+            actual = json.loads(bytes(buffer[:length]).decode("utf-8"))
+
+        expected = {
+            "custom-rendezvous-server": os.environ["ASAPSS_ID_SERVER"],
+            "relay-server": os.environ["ASAPSS_RELAY_SERVER"],
+            "key": os.environ["ASAPSS_PUBLIC_KEY"],
+            "api-server": "",
+        }
+        if actual != expected:
+            raise SystemExit("Runtime defaults mismatch: " + repr(actual))
+        print("PASS: compiled DLL initializes the expected server, relay and public key")
+        print("DLL SHA256:", digest(dll))
+      env:
+        ASAPSS_ID_SERVER: r.asapss.ir
+        ASAPSS_RELAY_SERVER: r.asapss.ir
+        ASAPSS_PUBLIC_KEY: FCukWggv4pqqFwJHx1VKYuU5q0YXo+jwXLyfEiw8teY=
     - name: Build self-extracted executable
       shell: bash
       run: |
